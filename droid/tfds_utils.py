@@ -1,10 +1,12 @@
+import multiprocessing as mp
+mp.set_start_method("spawn", force=True)
+from multiprocessing import Pool
 from typing import Tuple, Any, Dict, Union, Callable, Iterable
 import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import itertools
-from multiprocessing import Pool
 from functools import partial
 from tensorflow_datasets.core import download
 from tensorflow_datasets.core import split_builder as split_builder_lib
@@ -20,7 +22,6 @@ Key = Union[str, int]
 # The nested example dict passed to `features.encode_example`
 Example = Dict[str, Any]
 KeyExample = Tuple[Key, Example]
-
 
 class MultiThreadedDatasetBuilder(tfds.core.GeneratorBasedBuilder):
     """DatasetBuilder for example dataset."""

@@ -4,32 +4,63 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import os
+import json
 from PIL import Image
 
 from droid.droid_utils import load_trajectory, crawler
 from droid.tfds_utils import MultiThreadedDatasetBuilder
-
-
-# We assume a fixed language instruction here -- if your dataset has various instructions, please modify
-LANGUAGE_INSTRUCTION = 'Do something'
+import random
 
 # Modify to point to directory with raw DROID MP4 data
-DATA_PATH = "path_to_your_data"
-
+DATA_PATH = "/vault/CHORDSkills/DROID"
+# Find the file called aggregated-annotations in DATA_PATH
+ANNOTATION_PATH = None
+for fname in os.listdir(DATA_PATH):
+    if fname.startswith("aggregated-annotations"):
+        ANNOTATION_PATH = os.path.join(DATA_PATH, fname)
+        break
+if ANNOTATION_PATH is None:
+    print("aggregated-annotations file not found in DATA_PATH.")
+else:
+    print(f"Found aggregated-annotations file: {ANNOTATION_PATH}")
+    
+with open(ANNOTATION_PATH, 'r') as f:
+    annotations = json.load(f)
+    
 # (180, 320) is the default resolution, modify if different resolution is desired
 IMAGE_RES = (180, 320)
 
 
+use_depth = True
+
+def get_cam_extrinsics(metadata, data, i):
+    _data = data[i]  # assuming all data has the same structure
+    CAMERA_NAMES = ["ext1", "ext2", "wrist"]
+    serial = {
+        camera_name: metadata[f"{camera_name}_cam_serial"]
+        for camera_name in CAMERA_NAMES
+    }
+    extrinsics = {}
+    for camera_name, serial_key in serial.items():
+        if f"{serial_key}_left" in _data["observation"]["camera_extrinsics"]:
+            extrinsics[camera_name + "_left"] = np.array(_data["observation"]["camera_extrinsics"][
+                f"{serial_key}_left"
+            ]).astype(np.float32)
+            
+        if f"{serial_key}_right" in _data["observation"]["camera_extrinsics"]:
+            extrinsics[camera_name + "_right"] = np.array(_data["observation"]["camera_extrinsics"][
+                f"{serial_key}_right"
+            ]).astype(np.float32)
+            
+    return extrinsics
+
+
 def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
-
-    def _resize_and_encode(image, size):
-        image = Image.fromarray(image)
-        return np.array(image.resize(size, resample=Image.BICUBIC))
-
     def _parse_example(episode_path):
         h5_filepath = os.path.join(episode_path, 'trajectory.h5')
         recording_folderpath = os.path.join(episode_path, 'recordings', 'MP4')
-
+        if use_depth:
+            import pyzed.sl as sl
         try:
             data = load_trajectory(h5_filepath, recording_folderpath=recording_folderpath)
         except:
@@ -37,31 +68,91 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
            return None
 
         # get language instruction -- modify if more than one instruction
-        lang = LANGUAGE_INSTRUCTION
+        # Find the metadata JSON file (named meta_<HASH>.json) in the episode path
+        json_files = [f for f in os.listdir(episode_path) if f.startswith('metadata_') and f.endswith('.json')]
+        if not json_files:
+            print(f"Skipping trajectory because metadata JSON not found for {episode_path}.")
+            return None
+        json_path = os.path.join(episode_path, json_files[0])
+        with open(json_path, 'r') as f:
+            metadata = json.load(f)
+            
+        TASKS_ID = metadata.get('uuid', '')
+        if TASKS_ID not in annotations:
+            print(f"Skipping trajectory because no annotations found for {TASKS_ID} in {ANNOTATION_PATH}.")
+            return None
+        lang = ''
+        lang_entry = annotations.get(TASKS_ID, {})
+        if isinstance(lang_entry, dict):
+            lang_keys = [k for k in lang_entry.keys() if k.startswith('language_instruction')]
+            if lang_keys:
+                chosen_key = random.choice(lang_keys)
+                lang = lang_entry[chosen_key]
+                
+        # if use_depth is True, initialize a ZED camera for each view
+        if use_depth:
+            depth_cams = {}
+            for cam_name in ["ext1", "ext2", "wrist"]:
+                serial_val = metadata.get(f"{cam_name}_cam_serial")
+                init_params = sl.InitParameters()
+                svo_path = os.path.join(episode_path, "recordings", "SVO", f"{serial_val}.svo")
+                init_params.set_from_svo_file(svo_path)
+                init_params.depth_mode = sl.DEPTH_MODE.QUALITY
+                init_params.svo_real_time_mode = False
+                init_params.coordinate_units = sl.UNIT.METER
+                init_params.depth_minimum_distance = 0.2
+                cam = sl.Camera()
+                err = cam.open(init_params)
+                if err != sl.ERROR_CODE.SUCCESS:
+                    print(f"Error reading camera data for {cam_name}: {err}")
+                    depth_cams[cam_name] = None
+                else:
+                    depth_cams[cam_name] = cam
 
+        def _resize_and_encode(image, size):
+            image = Image.fromarray(image)
+            return np.array(image.resize(size, resample=Image.BICUBIC))
+        
         try:
             assert all(t.keys() == data[0].keys() for t in data)
-            for t in range(len(data)):
-                for key in data[0]['observation']['image'].keys():
-                    data[t]['observation']['image'][key] = _resize_and_encode(
-                        data[t]['observation']['image'][key], (IMAGE_RES[1], IMAGE_RES[0])
-                    )
-
-            # assemble episode --> here we're assuming demos so we set reward to 1 at the end
             episode = []
-        
             for i, step in enumerate(data):
                 obs = step['observation']
                 action = step['action']
                 camera_type_dict = obs['camera_type']
                 wrist_ids = [k for k, v in camera_type_dict.items() if v == 0]
                 exterior_ids = [k for k, v in camera_type_dict.items() if v != 0]
-
+                cam_extrinsics = get_cam_extrinsics(metadata, data, i)
+                
+                # if depth is desired, grab a new depth image from each camera
+                if use_depth:
+                    depth_images = {}
+                    for cam_name, cam in depth_cams.items():
+                        if cam is not None:
+                            rt_param = sl.RuntimeParameters()
+                            err = cam.grab(rt_param)
+                            if err == sl.ERROR_CODE.SUCCESS:
+                                depth_mat = sl.Mat()
+                                cam.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
+                                # Convert to numpy array. Depending on the version of the API you can use:
+                                depth_np = np.array(depth_mat.get_data())
+                                depth_np = _resize_and_encode(depth_np, (IMAGE_RES[1], IMAGE_RES[0]))
+                                depth_np = np.expand_dims(depth_np, axis=-1)
+                                depth_images[cam_name] = depth_np
+                            else:
+                                depth_images[cam_name] = np.zeros((*IMAGE_RES, 1), dtype=np.float32)
+                        else:
+                            depth_images[cam_name] = np.zeros((*IMAGE_RES, 1), dtype=np.float32)
+                
                 episode.append({
                     'observation': {
                         'exterior_image_1_left': obs['image'][f'{exterior_ids[0]}_left'][..., ::-1],
                         'exterior_image_2_left': obs['image'][f'{exterior_ids[1]}_left'][..., ::-1],
                         'wrist_image_left': obs['image'][f'{wrist_ids[0]}_left'][..., ::-1],
+                        # Include depth information if available; otherwise, these keys can be ignored downstream.
+                        'exterior_depth_1_left': depth_images["ext1"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
+                        'exterior_depth_2_left': depth_images["ext2"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
+                        'wrist_depth_left': depth_images["wrist"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
                         'cartesian_position': obs['robot_state']['cartesian_position'],
                         'joint_position': obs['robot_state']['joint_positions'],
                         'gripper_position': np.array([obs['robot_state']['gripper_position']]),
@@ -81,25 +172,36 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                     'is_last': i == (len(data) - 1),
                     'is_terminal': i == (len(data) - 1),
                     'language_instruction': lang,
+                    'cam_extrinsics': cam_extrinsics
                 })
+            # close depth cameras
+            if use_depth:
+                for cam in depth_cams.values():
+                    if cam is not None:
+                        cam.close()
         except:
            print(f"Skipping trajectory because there was an error in data processing for {episode_path}.")
+           if use_depth:
+               for cam in depth_cams.values():
+                   if cam is not None:
+                       cam.close()
            return None
 
-        # create output data sample
+        # # create output data sample
         sample = {
             'steps': episode,
             'episode_metadata': {
                 'file_path': h5_filepath,
                 'recording_folderpath': recording_folderpath
-            }
+            },
         }
-        # if you want to skip an example for whatever reason, simply return None
-        return episode_path, sample
+        # # if you want to skip an example for whatever reason, simply return None
+        # return episode_path, sample
 
     # for smallish datasets, use single-thread parsing
     for sample in paths:
-       yield _parse_example(sample)
+        yield _parse_example(sample)
+        # _parse_example(sample)
 
 
 class Droid(MultiThreadedDatasetBuilder):
@@ -110,8 +212,8 @@ class Droid(MultiThreadedDatasetBuilder):
       '1.0.0': 'Initial release.',
     }
 
-    N_WORKERS = 10                  # number of parallel workers for data conversion
-    MAX_PATHS_IN_MEMORY = 100       # number of paths converted & stored in memory before writing to disk
+    N_WORKERS = 6                  # number of parallel workers for data conversion
+    MAX_PATHS_IN_MEMORY = 10       # number of paths converted & stored in memory before writing to disk
                                     # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
                                     # note that one path may yield multiple episodes and adjust accordingly
     PARSE_FCN = _generate_examples  # handle to parse function from file paths to RLDS episodes
@@ -139,6 +241,21 @@ class Droid(MultiThreadedDatasetBuilder):
                             dtype=np.uint8,
                             encoding_format='jpeg',
                             doc='Wrist camera RGB left viewpoint',
+                        ),
+                        'exterior_depth_1_left': tfds.features.Tensor(
+                            shape=(*IMAGE_RES, 1),
+                            dtype=np.float32,
+                            doc='Depth map for exterior camera 1 left viewpoint.'
+                        ),
+                        'exterior_depth_2_left': tfds.features.Tensor(
+                            shape=(*IMAGE_RES, 1),
+                            dtype=np.float32,
+                            doc='Depth map for exterior camera 2 left viewpoint.'
+                        ),
+                        'wrist_depth_left': tfds.features.Tensor(
+                            shape=(*IMAGE_RES, 1),
+                            dtype=np.float32,
+                            doc='Depth map for wrist camera left viewpoint.'
                         ),
                         'cartesian_position': tfds.features.Tensor(
                             shape=(6,),
@@ -217,6 +334,38 @@ class Droid(MultiThreadedDatasetBuilder):
                     'language_instruction': tfds.features.Text(
                         doc='Language Instruction.'
                     ),
+                    'cam_extrinsics': tfds.features.FeaturesDict({
+                        'wrist_left': tfds.features.Tensor(
+                            shape=(6,),
+                            dtype=np.float32,
+                            doc='Extrinsics for wrist camera left viewpoint.'
+                        ),
+                        'wrist_right': tfds.features.Tensor(
+                            shape=(6,),
+                            dtype=np.float32,
+                            doc='Extrinsics for wrist camera right viewpoint.'
+                        ),
+                        'ext1_left': tfds.features.Tensor(
+                            shape=(6,),
+                            dtype=np.float32,
+                            doc='Extrinsics for exterior camera 1 left viewpoint.'
+                        ),
+                        'ext1_right': tfds.features.Tensor(
+                            shape=(6,),
+                            dtype=np.float32,
+                            doc='Extrinsics for exterior camera 1 right viewpoint.'
+                        ),
+                        'ext2_left': tfds.features.Tensor(
+                            shape=(6,),
+                            dtype=np.float32,
+                            doc='Extrinsics for exterior camera 2 left viewpoint.'
+                        ),
+                        'ext2_right': tfds.features.Tensor(
+                            shape=(6,),
+                            dtype=np.float32,
+                            doc='Extrinsics for exterior camera 2 right viewpoint.'
+                        )
+                    })
                 }),
                 'episode_metadata': tfds.features.FeaturesDict({
                     'file_path': tfds.features.Text(
@@ -240,3 +389,14 @@ class Droid(MultiThreadedDatasetBuilder):
         return {
             'train': episode_paths,
         }
+
+# if __name__ == '__main__':
+#     print("Crawling all episode paths...")
+#     episode_paths = crawler(DATA_PATH)
+#     episode_paths = [p for p in episode_paths if os.path.exists(p + '/trajectory.h5') and \
+#                         os.path.exists(p + '/recordings/MP4')]
+#     print(f"Found {len(episode_paths)} episodes!")
+#     res = _generate_examples(episode_paths)
+#     breakpoint()
+#     print("Example generation complete.")
+
