@@ -12,7 +12,8 @@ from droid.tfds_utils import MultiThreadedDatasetBuilder
 import random
 
 # Modify to point to directory with raw DROID MP4 data
-DATA_PATH = "/vault/CHORDSkills/DROID"
+DATA_PATH = "/vault/CHORDSkills/DROID_RAW"
+VER = "1.0.1"  # version of the dataset
 # Find the file called aggregated-annotations in DATA_PATH
 ANNOTATION_PATH = None
 for fname in os.listdir(DATA_PATH):
@@ -56,9 +57,16 @@ def get_cam_extrinsics(metadata, data, i):
 
 
 def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
+    def _resize_and_encode(image, size):
+            # Resize
+            resized = Image.fromarray(image).resize(size, resample=Image.BICUBIC)
+            resized_np = np.array(resized)
+            return resized_np
+        
     def _parse_example(episode_path):
         h5_filepath = os.path.join(episode_path, 'trajectory.h5')
         recording_folderpath = os.path.join(episode_path, 'recordings', 'MP4')
+        print(f"Processing episode: {episode_path}")
         if use_depth:
             import pyzed.sl as sl
         try:
@@ -109,12 +117,16 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 else:
                     depth_cams[cam_name] = cam
 
-        def _resize_and_encode(image, size):
-            image = Image.fromarray(image)
-            return np.array(image.resize(size, resample=Image.BICUBIC))
         
         try:
             assert all(t.keys() == data[0].keys() for t in data)
+            # Preformat RGB
+            for t in range(len(data)):
+                for key in data[0]['observation']['image'].keys():
+                    data[t]['observation']['image'][key] = _resize_and_encode(
+                        data[t]['observation']['image'][key], (IMAGE_RES[1], IMAGE_RES[0])
+                    )
+
             episode = []
             for i, step in enumerate(data):
                 obs = step['observation']
@@ -139,6 +151,8 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                                 depth_np = _resize_and_encode(depth_np, (IMAGE_RES[1], IMAGE_RES[0]))
                                 depth_np = np.expand_dims(depth_np, axis=-1)
                                 depth_images[cam_name] = depth_np
+                                # Replace NaN values with zeros
+                                depth_images[cam_name] = np.nan_to_num(depth_images[cam_name], nan=0.0)
                             else:
                                 depth_images[cam_name] = np.zeros((*IMAGE_RES, 1), dtype=np.float32)
                         else:
@@ -146,6 +160,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 
                 episode.append({
                     'observation': {
+                        # RGB images
                         'exterior_image_1_left': obs['image'][f'{exterior_ids[0]}_left'][..., ::-1],
                         'exterior_image_2_left': obs['image'][f'{exterior_ids[1]}_left'][..., ::-1],
                         'wrist_image_left': obs['image'][f'{wrist_ids[0]}_left'][..., ::-1],
@@ -153,6 +168,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                         'exterior_depth_1_left': depth_images["ext1"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
                         'exterior_depth_2_left': depth_images["ext2"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
                         'wrist_depth_left': depth_images["wrist"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
+                        # Robot state information
                         'cartesian_position': obs['robot_state']['cartesian_position'],
                         'joint_position': obs['robot_state']['joint_positions'],
                         'gripper_position': np.array([obs['robot_state']['gripper_position']]),
@@ -196,7 +212,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
             },
         }
         # # if you want to skip an example for whatever reason, simply return None
-        # return episode_path, sample
+        return episode_path, sample
 
     # for smallish datasets, use single-thread parsing
     for sample in paths:
@@ -207,12 +223,12 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
 class Droid(MultiThreadedDatasetBuilder):
     """DatasetBuilder for example dataset."""
 
-    VERSION = tfds.core.Version('1.0.0')
+    VERSION = tfds.core.Version(VER)
     RELEASE_NOTES = {
-      '1.0.0': 'Initial release.',
+      VER: 'Fixed RGB parsing',
     }
 
-    N_WORKERS = 6                  # number of parallel workers for data conversion
+    N_WORKERS = 4                  # number of parallel workers for data conversion
     MAX_PATHS_IN_MEMORY = 10       # number of paths converted & stored in memory before writing to disk
                                     # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
                                     # note that one path may yield multiple episodes and adjust accordingly
@@ -377,12 +393,16 @@ class Droid(MultiThreadedDatasetBuilder):
                 }),
             }))
 
-    def _split_paths(self):
+    def _split_paths(self, perc = 1):
         """Define data splits."""
         # create list of all examples -- by default we put all examples in 'train' split
         # add more elements to the dict below if you have more splits in your data
         print("Crawling all episode paths...")
         episode_paths = crawler(DATA_PATH)
+        if perc < 100:
+            n = max(1, int(len(episode_paths) * perc / 100))
+            episode_paths = random.sample(episode_paths, n)
+        print(f"loading {len(episode_paths)} episodes from {DATA_PATH}...")
         episode_paths = [p for p in episode_paths if os.path.exists(p + '/trajectory.h5') and \
                          os.path.exists(p + '/recordings/MP4')]
         print(f"Found {len(episode_paths)} episodes!")

@@ -115,6 +115,18 @@ class _SplitInfoFuture:
 def parse_examples_from_generator(paths, fcn, split_name, total_num_examples, features, serializer):
     generator = fcn(paths)
     outputs = []
+    examples = utils.tqdm(
+            generator,
+            desc=f'Generating {split_name} examples...',
+            unit=' examples',
+            total=total_num_examples,
+            leave=False,
+            mininterval=1.0,
+    )
+    
+    if examples is None:
+        return None
+    
     for sample in utils.tqdm(
             generator,
             desc=f'Generating {split_name} examples...',
@@ -191,6 +203,7 @@ class ParallelSplitBuilder(split_builder_lib.SplitBuilder):
             # write results to shuffler --> this will automatically offload to disk if necessary
             print("Writing conversion results...")
             for result in itertools.chain(*results):
+                if result is None: continue
                 key, serialized_example = result
                 writer._shuffler.add(key, serialized_example)
                 writer._num_examples += 1

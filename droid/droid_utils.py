@@ -123,12 +123,15 @@ class RecordedMultiCameraWrapper:
 
         # Open Camera Readers #
         svo_filepaths = []
-        mp4_filepaths = glob.glob(recording_folderpath + "/*.mp4")
+        mp4_filepaths = glob.glob(recording_folderpath + "/*-stereo.mp4")
         all_filepaths = svo_filepaths + mp4_filepaths
+        
+        if len(all_filepaths) == 0:
+            print(f"\033[91m{recording_folderpath} does not contain any cameras.\033[0m")
 
         self.camera_dict = {}
         for f in all_filepaths:
-            serial_number = f.split("/")[-1][:-4]
+            serial_number = f.split("/")[-1][:-4].replace("-stereo", "")            
             cam_type = get_camera_type(serial_number)
             camera_kwargs.get(cam_type, {})
 
