@@ -1,19 +1,25 @@
 from typing import Iterator, Tuple, Any
-
+import traceback
 import numpy as np
+import logging, os
+logging.disable(logging.WARNING)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import os
 import json
 from PIL import Image
 
+import random
+from skimage.measure import block_reduce
+from scipy.spatial.transform import Rotation
 from droid.droid_utils import load_trajectory, crawler
 from droid.tfds_utils import MultiThreadedDatasetBuilder
-import random
+import warnings
 
 # Modify to point to directory with raw DROID MP4 data
-DATA_PATH = "/vault/CHORDSkills/DROID_RAW"
-VER = "1.0.1"  # version of the dataset
+DATA_PATH = "/vault/CHORDSkills/DROID3D_RAW"
+VER = "5.0.0"  # version of the dataset
 # Find the file called aggregated-annotations in DATA_PATH
 ANNOTATION_PATH = None
 for fname in os.listdir(DATA_PATH):
@@ -28,9 +34,8 @@ else:
 with open(ANNOTATION_PATH, 'r') as f:
     annotations = json.load(f)
     
-# (180, 320) is the default resolution, modify if different resolution is desired
 IMAGE_RES = (180, 320)
-
+MAX_DEPTH = 3  # maximum depth value in meters
 
 use_depth = True
 
@@ -43,6 +48,9 @@ def get_cam_extrinsics(metadata, data, i):
     }
     extrinsics = {}
     for camera_name, serial_key in serial.items():
+        # Dummy values for extrinsics if not available
+        extrinsics[camera_name + "_left"] = np.zeros(6, dtype=np.float32)
+        extrinsics[camera_name + "_right"] = np.zeros(6, dtype=np.float32)     
         if f"{serial_key}_left" in _data["observation"]["camera_extrinsics"]:
             extrinsics[camera_name + "_left"] = np.array(_data["observation"]["camera_extrinsics"][
                 f"{serial_key}_left"
@@ -55,7 +63,6 @@ def get_cam_extrinsics(metadata, data, i):
             
     return extrinsics
 
-
 def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
     def _resize_and_encode(image, size):
             # Resize
@@ -63,6 +70,24 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
             resized_np = np.array(resized)
             return resized_np
         
+    def downsample_depth_median(depth, k=4):
+        # If all depth values are zero, return a zero array
+        if np.all(depth == 0):
+            return np.zeros((IMAGE_RES[0], IMAGE_RES[1]), dtype=np.float32)
+        # Replace 0 with nan so they don’t pollute the median
+        depth_np = np.where(depth == 0, np.nan, depth)
+        with np.errstate(invalid="ignore"):
+            reduced_depth = block_reduce(depth_np, block_size=(k, k), func=np.nanmedian)
+        reduced_depth = np.nan_to_num(reduced_depth, nan=0.0)  # Replace nans with 0
+        H, W = reduced_depth.shape
+        if H != IMAGE_RES[0] or W != IMAGE_RES[1]:
+            depth_img = Image.fromarray(reduced_depth, mode="F")
+            depth_img_resized = depth_img.resize((IMAGE_RES[1], IMAGE_RES[0]), resample=Image.NEAREST)
+            reduced_depth =  np.array(depth_img_resized)
+        H, W = reduced_depth.shape
+        assert H == IMAGE_RES[0] and W == IMAGE_RES[1], f"Unexpected depth resolution: {H}x{W} != {IMAGE_RES[0]}x{IMAGE_RES[1]}"
+        return reduced_depth
+
     def _parse_example(episode_path):
         h5_filepath = os.path.join(episode_path, 'trajectory.h5')
         recording_folderpath = os.path.join(episode_path, 'recordings', 'MP4')
@@ -103,6 +128,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
             for cam_name in ["ext1", "ext2", "wrist"]:
                 serial_val = metadata.get(f"{cam_name}_cam_serial")
                 init_params = sl.InitParameters()
+                init_params.sdk_verbose = 0  
                 svo_path = os.path.join(episode_path, "recordings", "SVO", f"{serial_val}.svo")
                 init_params.set_from_svo_file(svo_path)
                 init_params.depth_mode = sl.DEPTH_MODE.QUALITY
@@ -116,25 +142,24 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                     depth_cams[cam_name] = None
                 else:
                     depth_cams[cam_name] = cam
-
         
         try:
             assert all(t.keys() == data[0].keys() for t in data)
-            # Preformat RGB
-            for t in range(len(data)):
-                for key in data[0]['observation']['image'].keys():
-                    data[t]['observation']['image'][key] = _resize_and_encode(
-                        data[t]['observation']['image'][key], (IMAGE_RES[1], IMAGE_RES[0])
-                    )
 
             episode = []
+            intrinsics = {}
+            cam_extrinsics = get_cam_extrinsics(metadata, data, 0)
             for i, step in enumerate(data):
                 obs = step['observation']
                 action = step['action']
                 camera_type_dict = obs['camera_type']
                 wrist_ids = [k for k, v in camera_type_dict.items() if v == 0]
                 exterior_ids = [k for k, v in camera_type_dict.items() if v != 0]
-                cam_extrinsics = get_cam_extrinsics(metadata, data, i)
+                _rgb_map = {
+                    'ext1': f'{exterior_ids[0]}_left',
+                    'ext2': f'{exterior_ids[1]}_left',
+                    'wrist': f'{wrist_ids[0]}_left'
+                }
                 
                 # if depth is desired, grab a new depth image from each camera
                 if use_depth:
@@ -148,15 +173,90 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                                 cam.retrieve_measure(depth_mat, sl.MEASURE.DEPTH)
                                 # Convert to numpy array. Depending on the version of the API you can use:
                                 depth_np = np.array(depth_mat.get_data())
-                                depth_np = _resize_and_encode(depth_np, (IMAGE_RES[1], IMAGE_RES[0]))
-                                depth_np = np.expand_dims(depth_np, axis=-1)
                                 depth_images[cam_name] = depth_np
-                                # Replace NaN values with zeros
-                                depth_images[cam_name] = np.nan_to_num(depth_images[cam_name], nan=0.0)
-                            else:
-                                depth_images[cam_name] = np.zeros((*IMAGE_RES, 1), dtype=np.float32)
+                            elif err == sl.ERROR_CODE.END_OF_SVOFILE_REACHED:
+                                depth_images[cam_name] = np.zeros((*IMAGE_RES,), dtype=np.float32)
+
                         else:
-                            depth_images[cam_name] = np.zeros((*IMAGE_RES, 1), dtype=np.float32)
+                            depth_images[cam_name] = np.zeros((*IMAGE_RES,), dtype=np.float32)
+                
+                for cam_name, cam in depth_cams.items():
+                    rgb = obs['image'][_rgb_map[cam_name]].copy().astype(np.uint8)
+                    HD_RES = rgb.shape[:2]
+                    if cam is not None:
+                        # Read RGB and depth images
+                        depth = np.copy(depth_images[cam_name]).astype(np.float32)
+                        # Make sure rgb and depth images have the same resolution
+                        if np.all(depth == 0): # Handle empty frames
+                            depth = np.zeros((*HD_RES,), dtype=np.float32)
+                        assert rgb.shape[:2] == HD_RES, f"RGB and depth images have different resolutions: {rgb.shape[:2]} vs {HD_RES}"
+                        # Resize images to downsampled resolution
+                        rgb = _resize_and_encode(rgb, (IMAGE_RES[1], IMAGE_RES[0]))
+                        # Downsample depth map using median filter
+                        depth = downsample_depth_median(depth, k = HD_RES[0] // IMAGE_RES[0])
+                        depth = np.expand_dims(depth, axis=-1)
+                        depth[depth > MAX_DEPTH] = 0  # filter out invalid depth values
+                        # Read camera intrinsics for the first frame only
+                        if i == 0:
+                            params = (cam.get_camera_information().camera_configuration.calibration_parameters)
+                            
+                            # Adjust intrinsic parameters based on the scale factor
+                            left_intrinsic_mat = np.array(
+                                [
+                                    [params.left_cam.fx , 0, params.left_cam.cx],
+                                    [0, params.left_cam.fy, params.left_cam.cy],
+                                    [0, 0, 1],
+                                ]
+                            , dtype=np.float32)
+                            intrinsic  = left_intrinsic_mat.copy()
+                            # Adjust the intrinsic matrix for the resolution change
+                            s_h = HD_RES[0] / IMAGE_RES[0]
+                            s_w = HD_RES[1] / IMAGE_RES[1]
+                            intrinsic[0, 0] /= s_w   # fx'
+                            intrinsic[1, 1] /= s_h   # fy'
+                            intrinsic[0, 2] /= s_w   # cx'
+                            intrinsic[1, 2] /= s_h   # cy
+                            intrinsics[cam_name] = intrinsic # Store intrinsics only once per episode
+                        # Update RGB and depth images
+                        obs['image'][_rgb_map[cam_name]] = rgb
+                        depth_images[cam_name] = depth
+                        # # Build point cloud from depth map
+                        # H, W, _ = depth.shape
+                        # fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+                        # cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+                    
+                        # i_grid, j_grid = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
+                        # z = depth.flatten()
+                        # x = ((i_grid.flatten() - cx) * z) / fx
+                        # y = ((j_grid.flatten() - cy) * z) / fy
+
+                        # points = np.stack((x, y, z), axis=-1)
+                        # valid = (z > 0) & np.isfinite(z)
+                        # points = points[valid]
+                        # if not np.any(valid):
+                        #     colors = np.zeros((0, 3), dtype=np.uint8)
+                        # else:
+                        #     colors = rgb.reshape(-1, 3)[valid]                        
+                        #     # Apply extrinsics to the points
+                        #     extrinsics = np.array(extrinsics, dtype=np.float32)
+                        #     rotation = Rotation.from_euler("xyz", np.array(extrinsics[3:])).as_matrix().astype(np.float32)
+                        #     points = (rotation @ points.T).T + extrinsics[:3]
+                        # n_points = IMAGE_RES[0] * IMAGE_RES[1]
+                        # # Pad points and colors to have the same length
+                        # if points.shape[0] < n_points:
+                        #     padding = np.zeros((n_points - points.shape[0], 3), dtype=np.float32)
+                        #     points = np.vstack((points, padding))
+                        #     colors = np.vstack((colors, np.zeros((n_points - colors.shape[0], 3), dtype=np.uint8)))
+                        # elif points.shape[0] > n_points:
+                        #     points = points[:n_points]
+                        #     colors = colors[:n_points]
+                       
+                        # # Store point cloud
+                        # pcd[cam_name] = {
+                        #     'points': points.astype(np.float32),
+                        #     'colors': colors.astype(np.uint8)
+                        # }
+                # Check data
                 
                 episode.append({
                     'observation': {
@@ -168,6 +268,10 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                         'exterior_depth_1_left': depth_images["ext1"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
                         'exterior_depth_2_left': depth_images["ext2"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
                         'wrist_depth_left': depth_images["wrist"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
+                        # Point clouds
+                        # 'exterior_pc_1_left': pcd['ext1'],
+                        # 'exterior_pc_2_left': pcd['ext2'],
+                        # 'wrist_pc_left': pcd['wrist'],
                         # Robot state information
                         'cartesian_position': obs['robot_state']['cartesian_position'],
                         'joint_position': obs['robot_state']['joint_positions'],
@@ -186,9 +290,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                     'reward': float((i == (len(data) - 1) and 'success' in episode_path)),
                     'is_first': i == 0,
                     'is_last': i == (len(data) - 1),
-                    'is_terminal': i == (len(data) - 1),
-                    'language_instruction': lang,
-                    'cam_extrinsics': cam_extrinsics
+                    'is_terminal': i == (len(data) - 1)
                 })
             # close depth cameras
             if use_depth:
@@ -197,6 +299,8 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                         cam.close()
         except:
            print(f"Skipping trajectory because there was an error in data processing for {episode_path}.")
+           # Print traceback for debugging
+           traceback.print_exc()  
            if use_depth:
                for cam in depth_cams.values():
                    if cam is not None:
@@ -205,10 +309,13 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
 
         # # create output data sample
         sample = {
+            'language_instruction': lang,
             'steps': episode,
             'episode_metadata': {
                 'file_path': h5_filepath,
-                'recording_folderpath': recording_folderpath
+                'recording_folderpath': recording_folderpath,
+                'cam_extrinsics': cam_extrinsics,
+                'cam_intrinsics': intrinsics,
             },
         }
         # # if you want to skip an example for whatever reason, simply return None
@@ -229,7 +336,7 @@ class Droid(MultiThreadedDatasetBuilder):
     }
 
     N_WORKERS = 4                  # number of parallel workers for data conversion
-    MAX_PATHS_IN_MEMORY = 10       # number of paths converted & stored in memory before writing to disk
+    MAX_PATHS_IN_MEMORY = 3       # number of paths converted & stored in memory before writing to disk
                                     # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
                                     # note that one path may yield multiple episodes and adjust accordingly
     PARSE_FCN = _generate_examples  # handle to parse function from file paths to RLDS episodes
@@ -238,117 +345,161 @@ class Droid(MultiThreadedDatasetBuilder):
         """Dataset metadata (homepage, citation,...)."""
         return self.dataset_info_from_configs(
             features=tfds.features.FeaturesDict({
-            'steps': tfds.features.Dataset({
-                    'observation': tfds.features.FeaturesDict({
-                        'exterior_image_1_left': tfds.features.Image(
-                            shape=(*IMAGE_RES, 3),
-                            dtype=np.uint8,
-                            encoding_format='jpeg',
-                            doc='Exterior camera 1 left viewpoint',
-                        ),
-                        'exterior_image_2_left': tfds.features.Image(
-                            shape=(*IMAGE_RES, 3),
-                            dtype=np.uint8,
-                            encoding_format='jpeg',
-                            doc='Exterior camera 2 left viewpoint'
-                        ),
-                        'wrist_image_left': tfds.features.Image(
-                            shape=(*IMAGE_RES, 3),
-                            dtype=np.uint8,
-                            encoding_format='jpeg',
-                            doc='Wrist camera RGB left viewpoint',
-                        ),
-                        'exterior_depth_1_left': tfds.features.Tensor(
-                            shape=(*IMAGE_RES, 1),
-                            dtype=np.float32,
-                            doc='Depth map for exterior camera 1 left viewpoint.'
-                        ),
-                        'exterior_depth_2_left': tfds.features.Tensor(
-                            shape=(*IMAGE_RES, 1),
-                            dtype=np.float32,
-                            doc='Depth map for exterior camera 2 left viewpoint.'
-                        ),
-                        'wrist_depth_left': tfds.features.Tensor(
-                            shape=(*IMAGE_RES, 1),
-                            dtype=np.float32,
-                            doc='Depth map for wrist camera left viewpoint.'
-                        ),
-                        'cartesian_position': tfds.features.Tensor(
-                            shape=(6,),
-                            dtype=np.float64,
-                            doc='Robot Cartesian state',
-                        ),
-                        'gripper_position': tfds.features.Tensor(
-                            shape=(1,),
-                            dtype=np.float64,
-                            doc='Gripper position statae',
-                        ),
-                        'joint_position': tfds.features.Tensor(
+                'language_instruction': tfds.features.Text(
+                    doc='Language Instruction.'
+                ),
+                'steps': tfds.features.Dataset({
+                        'observation': tfds.features.FeaturesDict({
+                            'exterior_image_1_left': tfds.features.Image(
+                                shape=(*IMAGE_RES, 3),
+                                dtype=np.uint8,
+                                encoding_format='jpeg',
+                                doc='Exterior camera 1 left viewpoint',
+                            ),
+                            'exterior_image_2_left': tfds.features.Image(
+                                shape=(*IMAGE_RES, 3),
+                                dtype=np.uint8,
+                                encoding_format='jpeg',
+                                doc='Exterior camera 2 left viewpoint'
+                            ),
+                            'wrist_image_left': tfds.features.Image(
+                                shape=(*IMAGE_RES, 3),
+                                dtype=np.uint8,
+                                encoding_format='jpeg',
+                                doc='Wrist camera RGB left viewpoint',
+                            ),
+                            'exterior_depth_1_left': tfds.features.Tensor(
+                                shape=(*IMAGE_RES, 1),
+                                dtype=np.float32,
+                                doc='Depth map for exterior camera 1 left viewpoint.'
+                            ),
+                            'exterior_depth_2_left': tfds.features.Tensor(
+                                shape=(*IMAGE_RES, 1),
+                                dtype=np.float32,
+                                doc='Depth map for exterior camera 2 left viewpoint.'
+                            ),
+                            'wrist_depth_left': tfds.features.Tensor(
+                                shape=(*IMAGE_RES, 1),
+                                dtype=np.float32,
+                                doc='Depth map for wrist camera left viewpoint.'
+                            ),
+                            # 'exterior_pc_1_left': tfds.features.FeaturesDict({
+                            #     'points': tfds.features.Tensor(
+                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
+                            #         dtype=np.float32,
+                            #         doc='Point cloud for exterior camera 1 left viewpoint.'
+                            #     ),
+                            #     'colors': tfds.features.Tensor(
+                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
+                            #         dtype=np.uint8,
+                            #         doc='Colors for point cloud of exterior camera 1 left viewpoint.'
+                            #     )
+                            # }),
+                            # 'exterior_pc_2_left': tfds.features.FeaturesDict({
+                            #     'points': tfds.features.Tensor(
+                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
+                            #         dtype=np.float32,
+                            #         doc='Point cloud for exterior camera 2 left viewpoint.'
+                            #     ),
+                            #     'colors': tfds.features.Tensor(
+                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
+                            #         dtype=np.uint8,
+                            #         doc='Colors for point cloud of exterior camera 2 left viewpoint.'
+                            #     )
+                            # }),
+                            # 'wrist_pc_left': tfds.features.FeaturesDict({
+                            #     'points': tfds.features.Tensor(
+                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
+                            #         dtype=np.float32,
+                            #         doc='Point cloud for wrist camera left viewpoint.'
+                            #     ),
+                            #     'colors': tfds.features.Tensor(
+                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
+                            #         dtype=np.uint8,
+                            #         doc='Colors for point cloud of wrist camera left viewpoint.'
+                            #     )
+                            # }),
+                            'cartesian_position': tfds.features.Tensor(
+                                shape=(6,),
+                                dtype=np.float64,
+                                doc='Robot Cartesian state',
+                            ),
+                            'gripper_position': tfds.features.Tensor(
+                                shape=(1,),
+                                dtype=np.float64,
+                                doc='Gripper position statae',
+                            ),
+                            'joint_position': tfds.features.Tensor(
+                                shape=(7,),
+                                dtype=np.float64,
+                                doc='Joint position state'
+                            )
+                        }),
+                        'action_dict': tfds.features.FeaturesDict({
+                            'cartesian_position': tfds.features.Tensor(
+                                shape=(6,),
+                                dtype=np.float64,
+                                doc='Commanded Cartesian position'
+                            ),
+                            'cartesian_velocity': tfds.features.Tensor(
+                                shape=(6,),
+                                dtype=np.float64,
+                                doc='Commanded Cartesian velocity'
+                            ),
+                            'gripper_position': tfds.features.Tensor(
+                                shape=(1,),
+                                dtype=np.float64,
+                                doc='Commanded gripper position'
+                            ),
+                            'gripper_velocity': tfds.features.Tensor(
+                                shape=(1,),
+                                dtype=np.float64,
+                                doc='Commanded gripper velocity'
+                            ),
+                            'joint_position': tfds.features.Tensor(
+                                shape=(7,),
+                                dtype=np.float64,
+                                doc='Commanded joint position'
+                            ),
+                            'joint_velocity': tfds.features.Tensor(
+                                shape=(7,),
+                                dtype=np.float64,
+                                doc='Commanded joint velocity'
+                            )
+                        }),
+                        'action': tfds.features.Tensor(
                             shape=(7,),
                             dtype=np.float64,
-                            doc='Joint position state'
-                        )
+                            doc='Robot action, consists of [6x joint velocities, \
+                                1x gripper position].',
+                        ),
+                        'discount': tfds.features.Scalar(
+                            dtype=np.float32,
+                            doc='Discount if provided, default to 1.'
+                        ),
+                        'reward': tfds.features.Scalar(
+                            dtype=np.float32,
+                            doc='Reward if provided, 1 on final step for demos.'
+                        ),
+                        'is_first': tfds.features.Scalar(
+                            dtype=np.bool_,
+                            doc='True on first step of the episode.'
+                        ),
+                        'is_last': tfds.features.Scalar(
+                            dtype=np.bool_,
+                            doc='True on last step of the episode.'
+                        ),
+                        'is_terminal': tfds.features.Scalar(
+                            dtype=np.bool_,
+                            doc='True on last step of the episode if it is a terminal step, True for demos.'
+                        ),
                     }),
-                    'action_dict': tfds.features.FeaturesDict({
-                        'cartesian_position': tfds.features.Tensor(
-                            shape=(6,),
-                            dtype=np.float64,
-                            doc='Commanded Cartesian position'
-                        ),
-                        'cartesian_velocity': tfds.features.Tensor(
-                            shape=(6,),
-                            dtype=np.float64,
-                            doc='Commanded Cartesian velocity'
-                        ),
-                        'gripper_position': tfds.features.Tensor(
-                            shape=(1,),
-                            dtype=np.float64,
-                            doc='Commanded gripper position'
-                        ),
-                        'gripper_velocity': tfds.features.Tensor(
-                            shape=(1,),
-                            dtype=np.float64,
-                            doc='Commanded gripper velocity'
-                        ),
-                        'joint_position': tfds.features.Tensor(
-                            shape=(7,),
-                            dtype=np.float64,
-                            doc='Commanded joint position'
-                        ),
-                        'joint_velocity': tfds.features.Tensor(
-                            shape=(7,),
-                            dtype=np.float64,
-                            doc='Commanded joint velocity'
-                        )
-                    }),
-                    'action': tfds.features.Tensor(
-                        shape=(7,),
-                        dtype=np.float64,
-                        doc='Robot action, consists of [6x joint velocities, \
-                            1x gripper position].',
+                'episode_metadata': tfds.features.FeaturesDict({
+                    'file_path': tfds.features.Text(
+                        doc='Path to the original data file.'
                     ),
-                    'discount': tfds.features.Scalar(
-                        dtype=np.float32,
-                        doc='Discount if provided, default to 1.'
-                    ),
-                    'reward': tfds.features.Scalar(
-                        dtype=np.float32,
-                        doc='Reward if provided, 1 on final step for demos.'
-                    ),
-                    'is_first': tfds.features.Scalar(
-                        dtype=np.bool_,
-                        doc='True on first step of the episode.'
-                    ),
-                    'is_last': tfds.features.Scalar(
-                        dtype=np.bool_,
-                        doc='True on last step of the episode.'
-                    ),
-                    'is_terminal': tfds.features.Scalar(
-                        dtype=np.bool_,
-                        doc='True on last step of the episode if it is a terminal step, True for demos.'
-                    ),
-                    'language_instruction': tfds.features.Text(
-                        doc='Language Instruction.'
+                    'recording_folderpath': tfds.features.Text(
+                        doc='Path to the folder of recordings.'
                     ),
                     'cam_extrinsics': tfds.features.FeaturesDict({
                         'wrist_left': tfds.features.Tensor(
@@ -381,19 +532,28 @@ class Droid(MultiThreadedDatasetBuilder):
                             dtype=np.float32,
                             doc='Extrinsics for exterior camera 2 right viewpoint.'
                         )
-                    })
-                }),
-                'episode_metadata': tfds.features.FeaturesDict({
-                    'file_path': tfds.features.Text(
-                        doc='Path to the original data file.'
-                    ),
-                    'recording_folderpath': tfds.features.Text(
-                        doc='Path to the folder of recordings.'
-                    )
+                    }),
+                    'cam_intrinsics': tfds.features.FeaturesDict({
+                        'wrist': tfds.features.Tensor(
+                            shape=(3, 3),
+                            dtype=np.float32,
+                            doc='Intrinsic matrix for wrist camera.'
+                        ),
+                        'ext1': tfds.features.Tensor(
+                            shape=(3, 3),
+                            dtype=np.float32,
+                            doc='Intrinsic matrix for exterior camera 1.'
+                        ),
+                        'ext2': tfds.features.Tensor(
+                            shape=(3, 3),
+                            dtype=np.float32,
+                            doc='Intrinsic matrix for exterior camera 2.'
+                        )
+                    }),
                 }),
             }))
 
-    def _split_paths(self, perc = 1):
+    def _split_paths(self, perc = 10):
         """Define data splits."""
         # create list of all examples -- by default we put all examples in 'train' split
         # add more elements to the dict below if you have more splits in your data
@@ -416,7 +576,7 @@ class Droid(MultiThreadedDatasetBuilder):
 #     episode_paths = [p for p in episode_paths if os.path.exists(p + '/trajectory.h5') and \
 #                         os.path.exists(p + '/recordings/MP4')]
 #     print(f"Found {len(episode_paths)} episodes!")
+#     # res = _generate_examples(["/vault/CHORDSkills/DROID_RAW/CLVR/success/2023-05-09/Tue_May__9_01:34:10_2023/"])
 #     res = _generate_examples(episode_paths)
-#     breakpoint()
 #     print("Example generation complete.")
 
