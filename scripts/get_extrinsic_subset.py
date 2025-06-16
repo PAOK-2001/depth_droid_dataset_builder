@@ -3,11 +3,18 @@ import os
 import glob
 import tqdm
 import json
+import json, os, re, tempfile
+from pathlib import Path
+import shutil
+from shutil import copytree
+import numpy as np
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
+
 # PATHS
-RAW_DIR = '/vault/CHORDSkills/DROID_RAW'
-OUT_DIR = '/vault/CHORDSkills/DROID3D_RAW'
+RAW_DIR = '/vault/CHORDSkills/DROID_RAW_UPDATED'
+OUT_DIR = '/vault/CHORDSkills/DROID_3D'
 CLEANED_EXT_DIR = '/vault/CHORDSkills/DROID_UPDATED_EXTRINSICS/droid'
 BASE_EXT = os.path.join(CLEANED_EXT_DIR, 'cam2base_extrinsic_superset.json')
 
@@ -47,90 +54,137 @@ def get_quality_thresholds(auto_quantile=0.95):
         print(f"  Threshold: {thrsholds[metric]}")
     return thrsholds
 
-# Crawl
-def get_ext_subset(threshold: bool = False, thrs = None):
-    # Copy over JSON files from  RAW_DIR to OUT_DIR
-    if not os.path.exists(OUT_DIR):
-        os.makedirs(OUT_DIR)
-    json_files = glob.glob(os.path.join(RAW_DIR, '*.json'))
-    for json_file in tqdm.tqdm(json_files, desc="Copying JSON files"):
-        rel_path = os.path.relpath(json_file, RAW_DIR)
-        out_path = os.path.join(OUT_DIR, rel_path)
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        if not os.path.exists(out_path):
-            os.system(f'cp {json_file} {out_path}')
+def episode_id(path: Path) -> str:
+        """
+        Return the string that follows 'metadata_' and precedes '.json'.
+
+        Examples
+        --------
+        metadata_TRI+52ca9b6a+2024-02-13-10h-46m-49s.json
+        →  TRI+52ca9b6a+2024-02-13-10h-46m-49s
+        """
+        stem = path.stem                   # e.g. 'metadata_TRI+52ca9b6a+2024-02-13-10h-46m-49s'
+        prefix = 'metadata_'
+        if not stem.startswith(prefix):
+            raise ValueError(f"{path.name} does not start with '{prefix}'")
+        return stem[len(prefix):]   
+
+def get_ext_subset(
+        threshold: bool = True,
+        thrs: dict = None,
+        in_place: bool = False,
+        auto_quantile: float = 0.60
+    ):
+    """
+    Copy episodes whose extrinsics pass quality filters into OUT_DIR
+    and overwrite their metadata with the cleaned extrinsics.
+
+    Args
+    ----
+    threshold      : If True, apply quality thresholds.
+    thrs           : Dict of metric → threshold.  If None they are
+                     derived automatically from BASE_EXT and `auto_quantile`.
+    in_place       : If True, patch metadata in RAW_DIR instead of copying.
+    auto_quantile  : Used only when `thrs is None`.
+    """
+    # ---------------- Paths --------------------------------------------------
+    RAW_DIR = Path('/vault/CHORDSkills/DROID_RAW_UPDATED')
+    OUT_DIR = Path('/vault/CHORDSkills/DROID_3D')
+    BASE_EXT = Path(os.path.join(CLEANED_EXT_DIR, 'cam2base_extrinsic_superset.json'))
     
-    # Crawl over the raw directory
-    episode_list = glob.glob(os.path.join(RAW_DIR, '*', 'success', '*', '*', 'metadata_*.json'))
-    with open(BASE_EXT, 'r') as f:
-        base_ext = json.load(f)
-    
-    episodes_to_keep = set(base_ext.keys())
-    processed_ep = 0
-    print(f"Found {len(episodes_to_keep)} episodes with cleaned extrinsics.")
-    for episode in tqdm.tqdm(episode_list, desc="Processing episodes"):
-        episode_id = episode[:-5].split("/")[-1].split("_")[-1]
-        episode_path = os.path.dirname(episode)
-        rel_path = os.path.relpath(episode_path, RAW_DIR)
-        if episode_id not in episodes_to_keep:
-            continue
-        # Make sure the calibration is within tolerance
-        ext_info = base_ext[episode_id]
-        keep = True
-        if threshold:
-            cam_serial_keys = [k for k in ext_info.keys() if k.isdigit()]
-            for cam_serial in cam_serial_keys:
-                metric, val = get_cam_metrics(ext_info, cam_serial)
-                if metric == 'Reprojection_error': 
-                    val = 1 / val
-                if val < thrs[metric]:
-                    keep = False
-                    continue 
-        if not keep:
-            continue
-        # Copy episode to CLEANED_EXT_DIR
-        cleaned_episode_path = os.path.join(OUT_DIR, rel_path)
-        # print(f"Copying episode {episode_id} to {cleaned_episode_path}")
-        os.makedirs(os.path.dirname(cleaned_episode_path), exist_ok=True)
-        if not os.path.exists(cleaned_episode_path):
-            os.system(f'cp -r {episode_path} {cleaned_episode_path}')
-        
-        # Open metadata file in copied episode
-        metadata_path = os.path.join(cleaned_episode_path, f'metadata_{episode_id}.json')
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        # Update extrinsics in metadata, this should be the matching ID in ext_info
+    # ---------------- helpers -------------------------------------------------
+    def passes_threshold(ep_info: dict) -> bool:
+        if not threshold:                     # fast path
+            return True
+        for ser in (k for k in ep_info if k.isdigit()):
+            metric = ep_info[f'{ser}_metric_type']
+            val    = ep_info[f'{ser}_quality_metric']
+            chk    = 1/val if metric == 'Reprojection_error' else val
+            if chk < thrs[metric]:
+                return False
+        return True
+
+    def patch_metadata(meta_path: Path, extrinsics: dict):
+        with open(meta_path) as f:
+            meta = json.load(f)
         for cam in ['wrist', 'ext1', 'ext2']:
-            serial = metadata[f'{cam}_cam_serial']
-            if serial in ext_info.keys():
-                metadata[f'{cam}_cam_extrinsics'] = ext_info[serial]
-                
-        # Save updated metadata
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=4)
-        
-        processed_ep += 1
-        
-    print(f"Processed {processed_ep} episodes with cleaned extrinsics.")
+            ser = meta[f'{cam}_cam_serial']
+            if ser in extrinsics:
+                meta[f'{cam}_cam_extrinsics'] = extrinsics[ser]
+        # atomic replace → never leaves half-written JSONs
+        with tempfile.NamedTemporaryFile('w', delete=False,
+                                         dir=meta_path.parent) as tf:
+            json.dump(meta, tf, indent=4)
+            tmp = tf.name
+        os.replace(tmp, meta_path)
+
+    # ---------------- derive thresholds if needed ----------------------------
+    with open(BASE_EXT) as f:
+        base_ext = json.load(f)
+
+    # ---------------- ensure output location ---------------------------------
+    if not in_place:
+        if OUT_DIR.exists():
+            shutil.rmtree(OUT_DIR)
+        OUT_DIR.mkdir(parents=True)
+
+    # ---------------- crawl & copy/patch -------------------------------------
+    kept = 0
+    episode_list = glob.glob(os.path.join(RAW_DIR, '*', 'success', '*', '*', 'metadata_*.json'))
+    tri_episodes = []
+    for ep in episode_list:
+        if '_TRI+' in ep:
+            tri_episodes.append(ep)
+    for ep_json in tqdm(tri_episodes, desc='Processing episodes'):
+        ep_json = Path(ep_json)
+        ep_id = episode_id(ep_json)
+        ext_info = base_ext.get(ep_id)
+        if ext_info is None or not passes_threshold(ext_info):
+            continue
+
+        dst_dir = ep_json.parent if in_place else \
+                  OUT_DIR / ep_json.relative_to(RAW_DIR).parent
+
+        if not in_place:                     # copy whole episode folder
+            copytree(ep_json.parent, dst_dir, dirs_exist_ok=False)
+            # NOTE: some episodes have two metadata files, make sure to only keep the one that matches the base_ext
+            metadata_files = list(dst_dir.glob('metadata_*.json'))
+            # Delete all metadata files except the one that matches the base_ext
+            for meta_file in metadata_files:
+                if meta_file.name != ep_json.name:
+                    print(f"Found duplicate metadata file: {meta_file.name}, "
+                          f"deleting it.")
+                    meta_file.unlink()
+            
+        assert ep_id in base_ext, \
+            f"Episode {ep_id} not found in base_ext."
+        patch_metadata(dst_dir / ep_json.name, ext_info)
+        kept += 1
+
+    print(f"✅  {kept} episodes copied/updated "
+          f"({'in-place' if in_place else 'to OUT_DIR'}).")
     
-    
+        
 def sanity_check():
     with open(BASE_EXT, 'r') as f:
         base_ext = json.load(f)
     # Check if the cleaned extrinsics are correct
     metrics = {}
     episode_list = glob.glob(os.path.join(OUT_DIR, '*', 'success', '*', '*', 'metadata_*.json'))
-    for episode in tqdm.tqdm(episode_list, desc="Sanity checking episodes"):
-        episode_id = episode[:-5].split("/")[-1].split("_")[-1]
+    for episode in tqdm(episode_list, desc="Sanity checking episodes"):
+        ep_id = episode_id(Path(episode))
+        if ep_id not in base_ext.keys():
+            continue
+        
         with open(episode, 'r') as f:
             metadata = json.load(f)
         for cam in ['wrist', 'ext1', 'ext2']:
             serial = metadata[f'{cam}_cam_serial']
-            if serial in base_ext[episode_id].keys():
-                ext = base_ext[episode_id][serial]
+            if serial in base_ext[ep_id].keys():
+                ext = base_ext[ep_id][serial]
                 if not np.allclose(metadata[f'{cam}_cam_extrinsics'], ext, atol=1e-6):
-                    raise ValueError(f"Episode {episode_id} has incorrect extrinsics for {cam} camera.")
-                metric, val = get_cam_metrics(base_ext[episode_id], serial)
+                    raise ValueError(f"Episode {ep_id} has incorrect extrinsics for {cam} camera.")
+                metric, val = get_cam_metrics(base_ext[ep_id], serial)
                 if metric not in metrics.keys():
                     metrics[metric] = []
                 metrics[metric].append(val)

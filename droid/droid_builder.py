@@ -19,7 +19,7 @@ import warnings
 
 # Modify to point to directory with raw DROID MP4 data
 DATA_PATH = "/vault/CHORDSkills/DROID3D_RAW"
-VER = "5.0.0"  # version of the dataset
+VER = "1.2.0"  # version of the dataset
 # Find the file called aggregated-annotations in DATA_PATH
 ANNOTATION_PATH = None
 for fname in os.listdir(DATA_PATH):
@@ -335,7 +335,7 @@ class Droid(MultiThreadedDatasetBuilder):
       VER: 'Fixed RGB parsing',
     }
 
-    N_WORKERS = 4                  # number of parallel workers for data conversion
+    N_WORKERS = 6                  # number of parallel workers for data conversion
     MAX_PATHS_IN_MEMORY = 3       # number of paths converted & stored in memory before writing to disk
                                     # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
                                     # note that one path may yield multiple episodes and adjust accordingly
@@ -553,7 +553,7 @@ class Droid(MultiThreadedDatasetBuilder):
                 }),
             }))
 
-    def _split_paths(self, perc = 10):
+    def _split_paths(self, perc = 100):
         """Define data splits."""
         # create list of all examples -- by default we put all examples in 'train' split
         # add more elements to the dict below if you have more splits in your data
