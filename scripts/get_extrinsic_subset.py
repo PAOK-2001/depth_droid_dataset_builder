@@ -12,9 +12,6 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 
-# PATHS
-RAW_DIR = '/vault/CHORDSkills/DROID_RAW_UPDATED'
-OUT_DIR = '/vault/CHORDSkills/DROID_3D'
 CLEANED_EXT_DIR = '/vault/CHORDSkills/DROID_UPDATED_EXTRINSICS/droid'
 BASE_EXT = os.path.join(CLEANED_EXT_DIR, 'cam2base_extrinsic_superset.json')
 
@@ -117,6 +114,21 @@ def get_ext_subset(
             json.dump(meta, tf, indent=4)
             tmp = tf.name
         os.replace(tmp, meta_path)
+        
+    def has_recording(episode_path: Path) -> bool:
+        recording_path = os.path.join(episode_path, 'recordings')
+        mp4_path = os.path.join(recording_path, 'MP4')
+        if not os.path.exists(recording_path) or len(os.listdir(mp4_path)) == 0:
+            print(f"\033[91m[ WARNING ] Episode {episode_path} has no recordings! Skipping.\033[0m")
+            return False
+        
+        # If MP4 path exits make sure there is at least one recording with stero X-stereo
+        mp4_files = glob.glob(os.path.join(mp4_path, '*-stereo.mp4'))
+        if len(mp4_files) == 0:
+            print(f"\033[91m[ WARNING ] Episode {episode_path} has no stereo recordings! Skipping.\033[0m")
+            return False
+        return True
+            
 
     # ---------------- derive thresholds if needed ----------------------------
     with open(BASE_EXT) as f:
@@ -135,11 +147,11 @@ def get_ext_subset(
     for ep in episode_list:
         if '_TRI+' in ep:
             tri_episodes.append(ep)
-    for ep_json in tqdm(tri_episodes, desc='Processing episodes'):
+    for ep_json in tqdm(episode_list, desc='Processing episodes'):
         ep_json = Path(ep_json)
         ep_id = episode_id(ep_json)
         ext_info = base_ext.get(ep_id)
-        if ext_info is None or not passes_threshold(ext_info):
+        if ext_info is None or not passes_threshold(ext_info) or not has_recording(ep_json.parent):
             continue
 
         dst_dir = ep_json.parent if in_place else \

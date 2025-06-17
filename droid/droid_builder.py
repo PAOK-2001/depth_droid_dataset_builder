@@ -18,8 +18,9 @@ from droid.tfds_utils import MultiThreadedDatasetBuilder
 import warnings
 
 # Modify to point to directory with raw DROID MP4 data
-DATA_PATH = "/vault/CHORDSkills/DROID3D_RAW"
-VER = "1.2.0"  # version of the dataset
+DATA_PATH = "/vault/CHORDSkills/DROID_3D"
+VER = "1.3.0"  # version of the dataset
+
 # Find the file called aggregated-annotations in DATA_PATH
 ANNOTATION_PATH = None
 for fname in os.listdir(DATA_PATH):
