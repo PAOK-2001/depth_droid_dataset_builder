@@ -27,10 +27,12 @@ for fname in os.listdir(DATA_PATH):
     if fname.startswith("aggregated-annotations"):
         ANNOTATION_PATH = os.path.join(DATA_PATH, fname)
         break
+    
 if ANNOTATION_PATH is None:
-    print("aggregated-annotations file not found in DATA_PATH.")
-else:
-    print(f"Found aggregated-annotations file: {ANNOTATION_PATH}")
+    print(f"\033[91maggregated-annotations file not found in {DATA_PATH}. Please ensure the file exists.\033[0m")
+    exit(1)
+
+print(f"\033[92mFound aggregated-annotations file: {ANNOTATION_PATH}\033[0m")
     
 with open(ANNOTATION_PATH, 'r') as f:
     annotations = json.load(f)
@@ -166,6 +168,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 if use_depth:
                     depth_images = {}
                     for cam_name, cam in depth_cams.items():
+                        intrinsics[cam_name] = np.zeros((3, 3), dtype=np.float32)  # Placeholder for intrinsics
                         if cam is not None:
                             rt_param = sl.RuntimeParameters()
                             err = cam.grab(rt_param)
@@ -184,15 +187,19 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 for cam_name, cam in depth_cams.items():
                     rgb = obs['image'][_rgb_map[cam_name]].copy().astype(np.uint8)
                     HD_RES = rgb.shape[:2]
+                    # Resize images to downsampled resolution
+                    rgb = _resize_and_encode(rgb, (IMAGE_RES[1], IMAGE_RES[0]))
+                    # Update
+                    obs['image'][_rgb_map[cam_name]] = rgb
+                    depth_images[cam_name] = np.zeros_like(rgb, dtype=np.float32) # Placeholder for depth images in case camera is not available
                     if cam is not None:
                         # Read RGB and depth images
                         depth = np.copy(depth_images[cam_name]).astype(np.float32)
                         # Make sure rgb and depth images have the same resolution
                         if np.all(depth == 0): # Handle empty frames
                             depth = np.zeros((*HD_RES,), dtype=np.float32)
-                        assert rgb.shape[:2] == HD_RES, f"RGB and depth images have different resolutions: {rgb.shape[:2]} vs {HD_RES}"
-                        # Resize images to downsampled resolution
-                        rgb = _resize_and_encode(rgb, (IMAGE_RES[1], IMAGE_RES[0]))
+                        assert depth.shape[:2] == HD_RES, f"RGB and depth images have different resolutions: {depth.shape[:2]} vs {HD_RES}"
+                        
                         # Downsample depth map using median filter
                         depth = downsample_depth_median(depth, k = HD_RES[0] // IMAGE_RES[0])
                         depth = np.expand_dims(depth, axis=-1)
@@ -219,46 +226,26 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                             intrinsic[1, 2] /= s_h   # cy
                             intrinsics[cam_name] = intrinsic # Store intrinsics only once per episode
                         # Update RGB and depth images
-                        obs['image'][_rgb_map[cam_name]] = rgb
                         depth_images[cam_name] = depth
-                        # # Build point cloud from depth map
-                        # H, W, _ = depth.shape
-                        # fx, fy = intrinsic[0, 0], intrinsic[1, 1]
-                        # cx, cy = intrinsic[0, 2], intrinsic[1, 2]
-                    
-                        # i_grid, j_grid = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
-                        # z = depth.flatten()
-                        # x = ((i_grid.flatten() - cx) * z) / fx
-                        # y = ((j_grid.flatten() - cy) * z) / fy
+                # Sanity check
+                # Make sure RGB images are in the correct format
+                for _, rgb_id in _rgb_map.items():
+                    rgb = obs['image'][rgb_id]
+                    if rgb.shape[:2] != IMAGE_RES:
+                        print(f"\033[91mImage {rgb_id} has unexpected resolution: {rgb.shape[:2]} != {IMAGE_RES}\033[0m")
+                        exit(1)
+                # Make sure that if depth is not all zeros, instrinsics are available
+                if use_depth:
+                    for cam_name, depth in depth_images.items():
+                        if depth.shape[:2] != IMAGE_RES:
+                            print(f"\033[91mDepth image {cam_name} has unexpected resolution: {depth.shape[:2]} != {IMAGE_RES}\033[0m")
+                            exit(1)
+                        if np.any(depth > 0):
+                            intrinsic = intrinsics.get(cam_name, None)
+                            if intrinsic is None or np.all(intrinsic == 0.0):
+                                print(f"\033[91mIntrinsic matrix for {cam_name} is missing or has unexpected shape: {intrinsic.shape if intrinsic is not None else 'None'}\033[0m")
+                                exit(1)
 
-                        # points = np.stack((x, y, z), axis=-1)
-                        # valid = (z > 0) & np.isfinite(z)
-                        # points = points[valid]
-                        # if not np.any(valid):
-                        #     colors = np.zeros((0, 3), dtype=np.uint8)
-                        # else:
-                        #     colors = rgb.reshape(-1, 3)[valid]                        
-                        #     # Apply extrinsics to the points
-                        #     extrinsics = np.array(extrinsics, dtype=np.float32)
-                        #     rotation = Rotation.from_euler("xyz", np.array(extrinsics[3:])).as_matrix().astype(np.float32)
-                        #     points = (rotation @ points.T).T + extrinsics[:3]
-                        # n_points = IMAGE_RES[0] * IMAGE_RES[1]
-                        # # Pad points and colors to have the same length
-                        # if points.shape[0] < n_points:
-                        #     padding = np.zeros((n_points - points.shape[0], 3), dtype=np.float32)
-                        #     points = np.vstack((points, padding))
-                        #     colors = np.vstack((colors, np.zeros((n_points - colors.shape[0], 3), dtype=np.uint8)))
-                        # elif points.shape[0] > n_points:
-                        #     points = points[:n_points]
-                        #     colors = colors[:n_points]
-                       
-                        # # Store point cloud
-                        # pcd[cam_name] = {
-                        #     'points': points.astype(np.float32),
-                        #     'colors': colors.astype(np.uint8)
-                        # }
-                # Check data
-                
                 episode.append({
                     'observation': {
                         # RGB images
@@ -269,10 +256,6 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                         'exterior_depth_1_left': depth_images["ext1"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
                         'exterior_depth_2_left': depth_images["ext2"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
                         'wrist_depth_left': depth_images["wrist"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
-                        # Point clouds
-                        # 'exterior_pc_1_left': pcd['ext1'],
-                        # 'exterior_pc_2_left': pcd['ext2'],
-                        # 'wrist_pc_left': pcd['wrist'],
                         # Robot state information
                         'cartesian_position': obs['robot_state']['cartesian_position'],
                         'joint_position': obs['robot_state']['joint_positions'],
@@ -336,7 +319,7 @@ class Droid(MultiThreadedDatasetBuilder):
       VER: 'Fixed RGB parsing',
     }
 
-    N_WORKERS = 6                  # number of parallel workers for data conversion
+    N_WORKERS = 4                  # number of parallel workers for data conversion
     MAX_PATHS_IN_MEMORY = 3       # number of paths converted & stored in memory before writing to disk
                                     # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
                                     # note that one path may yield multiple episodes and adjust accordingly
@@ -384,42 +367,6 @@ class Droid(MultiThreadedDatasetBuilder):
                                 dtype=np.float32,
                                 doc='Depth map for wrist camera left viewpoint.'
                             ),
-                            # 'exterior_pc_1_left': tfds.features.FeaturesDict({
-                            #     'points': tfds.features.Tensor(
-                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
-                            #         dtype=np.float32,
-                            #         doc='Point cloud for exterior camera 1 left viewpoint.'
-                            #     ),
-                            #     'colors': tfds.features.Tensor(
-                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
-                            #         dtype=np.uint8,
-                            #         doc='Colors for point cloud of exterior camera 1 left viewpoint.'
-                            #     )
-                            # }),
-                            # 'exterior_pc_2_left': tfds.features.FeaturesDict({
-                            #     'points': tfds.features.Tensor(
-                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
-                            #         dtype=np.float32,
-                            #         doc='Point cloud for exterior camera 2 left viewpoint.'
-                            #     ),
-                            #     'colors': tfds.features.Tensor(
-                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
-                            #         dtype=np.uint8,
-                            #         doc='Colors for point cloud of exterior camera 2 left viewpoint.'
-                            #     )
-                            # }),
-                            # 'wrist_pc_left': tfds.features.FeaturesDict({
-                            #     'points': tfds.features.Tensor(
-                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
-                            #         dtype=np.float32,
-                            #         doc='Point cloud for wrist camera left viewpoint.'
-                            #     ),
-                            #     'colors': tfds.features.Tensor(
-                            #         shape=((IMAGE_RES[0]*IMAGE_RES[1]), 3),
-                            #         dtype=np.uint8,
-                            #         doc='Colors for point cloud of wrist camera left viewpoint.'
-                            #     )
-                            # }),
                             'cartesian_position': tfds.features.Tensor(
                                 shape=(6,),
                                 dtype=np.float64,
@@ -428,7 +375,7 @@ class Droid(MultiThreadedDatasetBuilder):
                             'gripper_position': tfds.features.Tensor(
                                 shape=(1,),
                                 dtype=np.float64,
-                                doc='Gripper position statae',
+                                doc='Gripper position state',
                             ),
                             'joint_position': tfds.features.Tensor(
                                 shape=(7,),

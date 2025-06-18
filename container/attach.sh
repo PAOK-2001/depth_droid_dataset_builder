@@ -1,3 +1,9 @@
 #!/usr/bin/env bash
 
-docker exec -it droid_container fish
+CONTAINER_NAME=droid_container
+USERNAME=dev
+
+docker exec -it --user $USERNAME \
+  -e XDG_RUNTIME_DIR=/home/$USERNAME/.xdg \
+  -e HOME=/home/$USERNAME \
+  $CONTAINER_NAME fish
