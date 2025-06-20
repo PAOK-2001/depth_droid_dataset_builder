@@ -19,7 +19,7 @@ import warnings
 
 # Modify to point to directory with raw DROID MP4 data
 DATA_PATH = "/vault/CHORDSkills/DROID_3D"
-VER = "1.3.0"  # version of the dataset
+VER = "0.0.5"  # version of the dataset
 
 # Find the file called aggregated-annotations in DATA_PATH
 ANNOTATION_PATH = None
@@ -168,7 +168,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 if use_depth:
                     depth_images = {}
                     for cam_name, cam in depth_cams.items():
-                        intrinsics[cam_name] = np.zeros((3, 3), dtype=np.float32)  # Placeholder for intrinsics
+                        if i == 0: intrinsics[cam_name] = np.zeros((3, 3), dtype=np.float32)  # Initialize intrinsics only once
                         if cam is not None:
                             rt_param = sl.RuntimeParameters()
                             err = cam.grab(rt_param)
@@ -191,7 +191,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                     rgb = _resize_and_encode(rgb, (IMAGE_RES[1], IMAGE_RES[0]))
                     # Update
                     obs['image'][_rgb_map[cam_name]] = rgb
-                    depth_images[cam_name] = np.zeros_like(rgb, dtype=np.float32) # Placeholder for depth images in case camera is not available
+                   
                     if cam is not None:
                         # Read RGB and depth images
                         depth = np.copy(depth_images[cam_name]).astype(np.float32)
@@ -224,9 +224,13 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                             intrinsic[1, 1] /= s_h   # fy'
                             intrinsic[0, 2] /= s_w   # cx'
                             intrinsic[1, 2] /= s_h   # cy
-                            intrinsics[cam_name] = intrinsic # Store intrinsics only once per episode
+                            intrinsics[cam_name] = intrinsic.copy() # Store intrinsics only once per episode
                         # Update RGB and depth images
                         depth_images[cam_name] = depth
+                    if cam is None:
+                        # If the camera is not available, set depth to zeros
+                        depth_images[cam_name] = np.zeros((*IMAGE_RES, 1), dtype=np.float32)
+                        if i == 0: intrinsics[cam_name] = np.zeros((3, 3), dtype=np.float32)
                 # Sanity check
                 # Make sure RGB images are in the correct format
                 for _, rgb_id in _rgb_map.items():
@@ -241,8 +245,8 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                             print(f"\033[91mDepth image {cam_name} has unexpected resolution: {depth.shape[:2]} != {IMAGE_RES}\033[0m")
                             exit(1)
                         if np.any(depth > 0):
-                            intrinsic = intrinsics.get(cam_name, None)
-                            if intrinsic is None or np.all(intrinsic == 0.0):
+                            int = intrinsics.get(cam_name, None)
+                            if int is None or np.all(int == 0.0):
                                 print(f"\033[91mIntrinsic matrix for {cam_name} is missing or has unexpected shape: {intrinsic.shape if intrinsic is not None else 'None'}\033[0m")
                                 exit(1)
 
@@ -291,6 +295,20 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                        cam.close()
            return None
 
+        for cam_name in ["ext1", "ext2", "wrist"]:
+            if intrinsics.get(cam_name).shape != (3, 3):
+                print(f"\033[91mIntrinsic matrix for {cam_name} has unexpected shape: {intrinsics[cam_name].shape}\033[0m")
+                exit(1)
+            if depth_cams.get(cam_name) is not None:
+                # If instrinsics is all zeros, raise an error
+                if np.all(intrinsics[cam_name] == 0.0):
+                    print(f"\033[91mIntrinsic matrix for {cam_name} is all zeros.\033[0m")
+                    exit(1)
+                    
+        if use_depth:
+               for cam in depth_cams.values():
+                   if cam is not None:
+                       cam.close()
         # # create output data sample
         sample = {
             'language_instruction': lang,
@@ -319,8 +337,8 @@ class Droid(MultiThreadedDatasetBuilder):
       VER: 'Fixed RGB parsing',
     }
 
-    N_WORKERS = 4                  # number of parallel workers for data conversion
-    MAX_PATHS_IN_MEMORY = 3       # number of paths converted & stored in memory before writing to disk
+    N_WORKERS = 8               # number of parallel workers for data conversion
+    MAX_PATHS_IN_MEMORY = 4     # number of paths converted & stored in memory before writing to disk
                                     # -> the higher the faster / more parallel conversion, adjust based on avilable RAM
                                     # note that one path may yield multiple episodes and adjust accordingly
     PARSE_FCN = _generate_examples  # handle to parse function from file paths to RLDS episodes
@@ -501,7 +519,7 @@ class Droid(MultiThreadedDatasetBuilder):
                 }),
             }))
 
-    def _split_paths(self, perc = 100):
+    def _split_paths(self, perc = 5):
         """Define data splits."""
         # create list of all examples -- by default we put all examples in 'train' split
         # add more elements to the dict below if you have more splits in your data
@@ -524,7 +542,7 @@ class Droid(MultiThreadedDatasetBuilder):
 #     episode_paths = [p for p in episode_paths if os.path.exists(p + '/trajectory.h5') and \
 #                         os.path.exists(p + '/recordings/MP4')]
 #     print(f"Found {len(episode_paths)} episodes!")
-#     # res = _generate_examples(["/vault/CHORDSkills/DROID_RAW/CLVR/success/2023-05-09/Tue_May__9_01:34:10_2023/"])
-#     res = _generate_examples(episode_paths)
+#     res = _generate_examples(["/vault/CHORDSkills/DROID_3D/TRI/success/2023-08-09/Wed_Aug__9_09:40:41_2023"])
+#     # res = _generate_examples(episode_paths)
 #     print("Example generation complete.")
 
