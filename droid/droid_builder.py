@@ -19,7 +19,7 @@ import warnings
 
 # Modify to point to directory with raw DROID MP4 data
 DATA_PATH = "/vault/CHORDSkills/DROID_3D"
-VER = "0.0.5"  # version of the dataset
+VER = "0.8.0"  # version of the dataset
 
 # Find the file called aggregated-annotations in DATA_PATH
 ANNOTATION_PATH = None
@@ -92,6 +92,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         return reduced_depth
 
     def _parse_example(episode_path):
+        # Build File paths
         h5_filepath = os.path.join(episode_path, 'trajectory.h5')
         recording_folderpath = os.path.join(episode_path, 'recordings', 'MP4')
         print(f"Processing episode: {episode_path}")
@@ -103,8 +104,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
            print(f"Skipping trajectory because data couldn't be loaded for {episode_path}.")
            return None
 
-        # get language instruction -- modify if more than one instruction
-        # Find the metadata JSON file (named meta_<HASH>.json) in the episode path
+        # Get language instruction
         json_files = [f for f in os.listdir(episode_path) if f.startswith('metadata_') and f.endswith('.json')]
         if not json_files:
             print(f"Skipping trajectory because metadata JSON not found for {episode_path}.")
@@ -227,10 +227,6 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                             intrinsics[cam_name] = intrinsic.copy() # Store intrinsics only once per episode
                         # Update RGB and depth images
                         depth_images[cam_name] = depth
-                    if cam is None:
-                        # If the camera is not available, set depth to zeros
-                        depth_images[cam_name] = np.zeros((*IMAGE_RES, 1), dtype=np.float32)
-                        if i == 0: intrinsics[cam_name] = np.zeros((3, 3), dtype=np.float32)
                 # Sanity check
                 # Make sure RGB images are in the correct format
                 for _, rgb_id in _rgb_map.items():
@@ -305,10 +301,6 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                     print(f"\033[91mIntrinsic matrix for {cam_name} is all zeros.\033[0m")
                     exit(1)
                     
-        if use_depth:
-               for cam in depth_cams.values():
-                   if cam is not None:
-                       cam.close()
         # # create output data sample
         sample = {
             'language_instruction': lang,
@@ -519,7 +511,7 @@ class Droid(MultiThreadedDatasetBuilder):
                 }),
             }))
 
-    def _split_paths(self, perc = 5):
+    def _split_paths(self, perc = 80):
         """Define data splits."""
         # create list of all examples -- by default we put all examples in 'train' split
         # add more elements to the dict below if you have more splits in your data
