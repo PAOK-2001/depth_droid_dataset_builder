@@ -19,7 +19,7 @@ import warnings
 
 # Modify to point to directory with raw DROID MP4 data
 DATA_PATH = "/vault/CHORDSkills/DROID_3D"
-VER = "0.8.0"  # version of the dataset
+VER = "2.6.0"  # version of the dataset
 
 # Find the file called aggregated-annotations in DATA_PATH
 ANNOTATION_PATH = None
@@ -40,8 +40,52 @@ with open(ANNOTATION_PATH, 'r') as f:
 IMAGE_RES = (180, 320)
 MAX_DEPTH = 3  # maximum depth value in meters
 
-use_depth = True
+use_depth = False
 
+def generate_splits(file_list, ratios=[80, 10, 10], seed=42):
+    """
+    Generate train/val/test splits from a list of files.
+    
+    Args:
+        file_list (list): List of file paths/names.
+        ratios (list): List of percentages [train, val, test]. Must sum to 100.
+        seed (int): Random seed for reproducibility.
+    
+    Returns:
+        dict: Dictionary with 'train', 'validation', 'test' keys mapping to lists of files.
+    """
+    import random
+    assert sum(ratios) == 100, "Ratios must sum to 100"
+    
+    # Shuffle for randomness
+    rng = random.Random(seed)
+    files = file_list[:]  # copy to avoid modifying original
+    rng.shuffle(files)
+    
+    n = len(files)
+    train_end = int(n * ratios[0] / 100)
+    val_end = int(n * (ratios[0] + ratios[1]) / 100)
+    
+    train_files = files[:train_end]
+    val_files = files[train_end:val_end]
+    test_files = files[val_end:]
+    
+    # Sanity check: ensure no duplicates
+    all_files = train_files + val_files + test_files
+    assert len(all_files) == len(set(all_files)), "Duplicate files found in splits!"
+    
+    # Print summary
+    print(f"Total files: {n}")
+    print(f"Train size: {len(train_files)}")
+    print(f"Validation size: {len(val_files)}")
+    print(f"Test size: {len(test_files)}")
+    
+    return {
+        'train': train_files,
+        'validation': val_files,
+        'test': test_files
+    }
+    
 def get_cam_extrinsics(metadata, data, i):
     _data = data[i]  # assuming all data has the same structure
     CAMERA_NAMES = ["ext1", "ext2", "wrist"]
@@ -92,12 +136,11 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         return reduced_depth
 
     def _parse_example(episode_path):
+        import pyzed.sl as sl
         # Build File paths
         h5_filepath = os.path.join(episode_path, 'trajectory.h5')
         recording_folderpath = os.path.join(episode_path, 'recordings', 'MP4')
         print(f"Processing episode: {episode_path}")
-        if use_depth:
-            import pyzed.sl as sl
         try:
             data = load_trajectory(h5_filepath, recording_folderpath=recording_folderpath)
         except:
@@ -117,6 +160,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
         if TASKS_ID not in annotations:
             print(f"Skipping trajectory because no annotations found for {TASKS_ID} in {ANNOTATION_PATH}.")
             return None
+        # breakpoint()
         lang = ''
         lang_entry = annotations.get(TASKS_ID, {})
         if isinstance(lang_entry, dict):
@@ -125,26 +169,25 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                 chosen_key = random.choice(lang_keys)
                 lang = lang_entry[chosen_key]
                 
-        # if use_depth is True, initialize a ZED camera for each view
-        if use_depth:
-            depth_cams = {}
-            for cam_name in ["ext1", "ext2", "wrist"]:
-                serial_val = metadata.get(f"{cam_name}_cam_serial")
-                init_params = sl.InitParameters()
-                init_params.sdk_verbose = 0  
-                svo_path = os.path.join(episode_path, "recordings", "SVO", f"{serial_val}.svo")
-                init_params.set_from_svo_file(svo_path)
-                init_params.depth_mode = sl.DEPTH_MODE.QUALITY
-                init_params.svo_real_time_mode = False
-                init_params.coordinate_units = sl.UNIT.METER
-                init_params.depth_minimum_distance = 0.2
-                cam = sl.Camera()
-                err = cam.open(init_params)
-                if err != sl.ERROR_CODE.SUCCESS:
-                    print(f"Error reading camera data for {cam_name}: {err}")
-                    depth_cams[cam_name] = None
-                else:
-                    depth_cams[cam_name] = cam
+
+        depth_cams = {}
+        for cam_name in ["ext1", "ext2", "wrist"]:
+            serial_val = metadata.get(f"{cam_name}_cam_serial")
+            init_params = sl.InitParameters()
+            init_params.sdk_verbose = 0  
+            svo_path = os.path.join(episode_path, "recordings", "SVO", f"{serial_val}.svo")
+            init_params.set_from_svo_file(svo_path)
+            init_params.depth_mode = sl.DEPTH_MODE.QUALITY
+            init_params.svo_real_time_mode = False
+            init_params.coordinate_units = sl.UNIT.METER
+            init_params.depth_minimum_distance = 0.2
+            cam = sl.Camera()
+            err = cam.open(init_params)
+            if err != sl.ERROR_CODE.SUCCESS:
+                print(f"Error reading camera data for {cam_name}: {err}")
+                depth_cams[cam_name] = None
+            else:
+                depth_cams[cam_name] = cam
         
         try:
             assert all(t.keys() == data[0].keys() for t in data)
@@ -194,16 +237,17 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                    
                     if cam is not None:
                         # Read RGB and depth images
-                        depth = np.copy(depth_images[cam_name]).astype(np.float32)
-                        # Make sure rgb and depth images have the same resolution
-                        if np.all(depth == 0): # Handle empty frames
-                            depth = np.zeros((*HD_RES,), dtype=np.float32)
-                        assert depth.shape[:2] == HD_RES, f"RGB and depth images have different resolutions: {depth.shape[:2]} vs {HD_RES}"
-                        
-                        # Downsample depth map using median filter
-                        depth = downsample_depth_median(depth, k = HD_RES[0] // IMAGE_RES[0])
-                        depth = np.expand_dims(depth, axis=-1)
-                        depth[depth > MAX_DEPTH] = 0  # filter out invalid depth values
+                        if use_depth:
+                            depth = np.copy(depth_images[cam_name]).astype(np.float32)
+                            # Make sure rgb and depth images have the same resolution
+                            if np.all(depth == 0): # Handle empty frames
+                                depth = np.zeros((*HD_RES,), dtype=np.float32)
+                            assert depth.shape[:2] == HD_RES, f"RGB and depth images have different resolutions: {depth.shape[:2]} vs {HD_RES}"
+                            
+                            # Downsample depth map using median filter
+                            depth = downsample_depth_median(depth, k = HD_RES[0] // IMAGE_RES[0])
+                            depth = np.expand_dims(depth, axis=-1)
+                            depth[depth > MAX_DEPTH] = 0  # filter out invalid depth values
                         # Read camera intrinsics for the first frame only
                         if i == 0:
                             params = (cam.get_camera_information().camera_configuration.calibration_parameters)
@@ -226,7 +270,7 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                             intrinsic[1, 2] /= s_h   # cy
                             intrinsics[cam_name] = intrinsic.copy() # Store intrinsics only once per episode
                         # Update RGB and depth images
-                        depth_images[cam_name] = depth
+                        if use_depth: depth_images[cam_name] = depth
                 # Sanity check
                 # Make sure RGB images are in the correct format
                 for _, rgb_id in _rgb_map.items():
@@ -253,9 +297,9 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
                         'exterior_image_2_left': obs['image'][f'{exterior_ids[1]}_left'][..., ::-1],
                         'wrist_image_left': obs['image'][f'{wrist_ids[0]}_left'][..., ::-1],
                         # Include depth information if available; otherwise, these keys can be ignored downstream.
-                        'exterior_depth_1_left': depth_images["ext1"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
-                        'exterior_depth_2_left': depth_images["ext2"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
-                        'wrist_depth_left': depth_images["wrist"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
+                        # 'exterior_depth_1_left': depth_images["ext1"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
+                        # 'exterior_depth_2_left': depth_images["ext2"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
+                        # 'wrist_depth_left': depth_images["wrist"] if use_depth else np.zeros((*IMAGE_RES, 1), dtype=np.float32),
                         # Robot state information
                         'cartesian_position': obs['robot_state']['cartesian_position'],
                         'joint_position': obs['robot_state']['joint_positions'],
@@ -306,10 +350,15 @@ def _generate_examples(paths) -> Iterator[Tuple[str, Any]]:
             'language_instruction': lang,
             'steps': episode,
             'episode_metadata': {
+                'uuid': metadata['uuid'],
+                'lab': metadata['lab'],
+                'success': metadata['success'],
+                'task': metadata['current_task'],
                 'file_path': h5_filepath,
                 'recording_folderpath': recording_folderpath,
                 'cam_extrinsics': cam_extrinsics,
                 'cam_intrinsics': intrinsics,
+                
             },
         }
         # # if you want to skip an example for whatever reason, simply return None
@@ -362,21 +411,21 @@ class Droid(MultiThreadedDatasetBuilder):
                                 encoding_format='jpeg',
                                 doc='Wrist camera RGB left viewpoint',
                             ),
-                            'exterior_depth_1_left': tfds.features.Tensor(
-                                shape=(*IMAGE_RES, 1),
-                                dtype=np.float32,
-                                doc='Depth map for exterior camera 1 left viewpoint.'
-                            ),
-                            'exterior_depth_2_left': tfds.features.Tensor(
-                                shape=(*IMAGE_RES, 1),
-                                dtype=np.float32,
-                                doc='Depth map for exterior camera 2 left viewpoint.'
-                            ),
-                            'wrist_depth_left': tfds.features.Tensor(
-                                shape=(*IMAGE_RES, 1),
-                                dtype=np.float32,
-                                doc='Depth map for wrist camera left viewpoint.'
-                            ),
+                            # 'exterior_depth_1_left': tfds.features.Tensor(
+                            #     shape=(*IMAGE_RES, 1),
+                            #     dtype=np.float32,
+                            #     doc='Depth map for exterior camera 1 left viewpoint.'
+                            # ),
+                            # 'exterior_depth_2_left': tfds.features.Tensor(
+                            #     shape=(*IMAGE_RES, 1),
+                            #     dtype=np.float32,
+                            #     doc='Depth map for exterior camera 2 left viewpoint.'
+                            # ),
+                            # 'wrist_depth_left': tfds.features.Tensor(
+                            #     shape=(*IMAGE_RES, 1),
+                            #     dtype=np.float32,
+                            #     doc='Depth map for wrist camera left viewpoint.'
+                            # ),
                             'cartesian_position': tfds.features.Tensor(
                                 shape=(6,),
                                 dtype=np.float64,
@@ -453,6 +502,19 @@ class Droid(MultiThreadedDatasetBuilder):
                         ),
                     }),
                 'episode_metadata': tfds.features.FeaturesDict({
+                    'uuid': tfds.features.Text(
+                        doc='Unique identifier for the episode.'
+                    ),
+                    'lab': tfds.features.Text(
+                        doc='The lab where the episode was recorded.'
+                    ),
+                    'success': tfds.features.Scalar(
+                        dtype=tf.bool,
+                        doc='True if the episode was successful.'
+                    ),
+                    'task': tfds.features.Text(
+                        doc='The task being performed in the episode.'
+                    ),
                     'file_path': tfds.features.Text(
                         doc='Path to the original data file.'
                     ),
@@ -511,7 +573,7 @@ class Droid(MultiThreadedDatasetBuilder):
                 }),
             }))
 
-    def _split_paths(self, perc = 80):
+    def _split_paths(self, perc = 60):
         """Define data splits."""
         # create list of all examples -- by default we put all examples in 'train' split
         # add more elements to the dict below if you have more splits in your data
@@ -524,9 +586,9 @@ class Droid(MultiThreadedDatasetBuilder):
         episode_paths = [p for p in episode_paths if os.path.exists(p + '/trajectory.h5') and \
                          os.path.exists(p + '/recordings/MP4')]
         print(f"Found {len(episode_paths)} episodes!")
-        return {
-            'train': episode_paths,
-        }
+        # Generate data splits
+        splits = generate_splits(episode_paths)
+        return splits
 
 # if __name__ == '__main__':
 #     print("Crawling all episode paths...")
@@ -534,7 +596,7 @@ class Droid(MultiThreadedDatasetBuilder):
 #     episode_paths = [p for p in episode_paths if os.path.exists(p + '/trajectory.h5') and \
 #                         os.path.exists(p + '/recordings/MP4')]
 #     print(f"Found {len(episode_paths)} episodes!")
-#     res = _generate_examples(["/vault/CHORDSkills/DROID_3D/TRI/success/2023-08-09/Wed_Aug__9_09:40:41_2023"])
-#     # res = _generate_examples(episode_paths)
+#     # res = _generate_examples(["/vault/CHORDSkills/DROID_3D/TRI/success/2023-08-09/Wed_Aug__9_09:40:41_2023"])
+#     res = _generate_examples(episode_paths)
 #     print("Example generation complete.")
 
